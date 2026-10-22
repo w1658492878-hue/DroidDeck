@@ -471,6 +471,11 @@ if [ -x /usr/local/bin/droiddeck-steamvr-flat ] && /usr/local/bin/droiddeck-stea
 fi
 exec /usr/local/bin/droiddeck-fex steam "$verb" "$@"
 """
+VALVE_FEX_TOOL = "fex-compat-tool"
+VALVE_FEX_WRAPPER_SH = """#!/bin/bash
+self=$(realpath "$0" 2>/dev/null || readlink -f "$0" 2>/dev/null || printf '%s' "$0")
+exec /usr/local/bin/droiddeck-fex valve-fex "${self}.droiddeck-orig" "$@"
+"""
 
 
 TOKEN = re.compile(r'\s*(?:"((?:[^"\\]|\\.)*)"|([{}])|//[^\n]*)')
@@ -662,18 +667,83 @@ def adopt_extras(tools):
     return adopted
 
 
+def adopt_fex_tool(steam_root):
+    adopted = []
+    for library in libraries(steam_root):
+        fex_dir = os.path.join(library, "steamapps", "common", "FEX-Emu")
+        target = os.path.join(fex_dir, VALVE_FEX_TOOL)
+        if not os.path.isdir(fex_dir) or not os.path.exists(target):
+            continue
+        original = target + ORIGINAL_SUFFIX
+        legacy = target + LEGACY_ORIGINAL_SUFFIX
+        if not os.path.isfile(original) and os.path.isfile(legacy):
+            try:
+                os.replace(legacy, original)
+            except OSError:
+                continue
+        try:
+            with open(target, encoding="utf-8", errors="replace") as f:
+                is_wrapper = f.read(len(VALVE_FEX_WRAPPER_SH) + 1) == VALVE_FEX_WRAPPER_SH
+        except OSError:
+            if os.path.isfile(original):
+                continue
+            is_wrapper = False
+        if not is_wrapper:
+            try:
+                shutil.copy2(target, original)
+            except OSError:
+                continue
+        try:
+            write_changed(target, VALVE_FEX_WRAPPER_SH, 0o755)
+            legacy_orig = target + LEGACY_ORIGINAL_SUFFIX
+            if os.path.isfile(legacy_orig):
+                os.unlink(legacy_orig)
+            adopted.append(target)
+        except OSError as e:
+            print("steam-compatibility: could not wrap %s (%s)" % (target, e))
+    return adopted
+
+
 NOT_GAMES = frozenset((
     "228980",
+    "858280",
+    "961940",
+    "993090",
+    "1054830",
     "1070560",
+    "1113280",
+    "1161040",
+    "1245040",
     "1391110",
-    "1628350",
+    "1420170",
     "1493710",
+    "1580130",
+    "1628350",
+    "1826330",
+    "1887720",
+    "2180100",
+    "2348590",
+    "2805730",
+    "3029110",
     "3127680",
+    "3658110",
     "4183110",
     "4185400",
     "4427310",
+    "4628710",
     "4628740",
+    "4690330",
 ))
+INSTALLDIR = re.compile(r'^\s*"installdir"\s*"([^"]*)"', re.M)
+
+
+def is_tool_manifest(steamapps, name):
+    try:
+        with open(os.path.join(steamapps, name), encoding="utf-8", errors="replace") as f:
+            m = INSTALLDIR.search(f.read())
+    except OSError:
+        return False
+    return bool(m and m.group(1) and os.path.isfile(os.path.join(steamapps, "common", m.group(1), "toolmanifest.vdf")))
 
 
 def libraries(steam_root):
@@ -698,7 +768,7 @@ def installed_apps(steam_root):
             continue
         for name in names:
             m = re.fullmatch(r"appmanifest_(\d+)\.acf", name)
-            if m and m.group(1) not in NOT_GAMES:
+            if m and m.group(1) not in NOT_GAMES and not is_tool_manifest(steamapps, name):
                 apps.add(m.group(1))
     return sorted(apps, key=int)
 
@@ -864,6 +934,53 @@ def valve_picks(steam_root):
     return sorted(picks, key=int)
 
 
+EAC_MARKERS = frozenset((
+    "easyanticheat_x64.so", "easyanticheat_x86.so",
+    "easyanticheat_eos_setup.exe", "start_protected_game.exe",
+    "easyanticheat_eos.dll", "easyanticheat_x64.dll", "anticheatinstaller.exe",
+))
+
+
+def is_eac_installed(steam_root, app):
+    for library in libraries(steam_root):
+        steamapps = os.path.join(library, "steamapps")
+        manifest = os.path.join(steamapps, "appmanifest_%s.acf" % app)
+        try:
+            with open(manifest, encoding="utf-8", errors="replace") as f:
+                m = INSTALLDIR.search(f.read())
+        except OSError:
+            continue
+        if not (m and m.group(1)):
+            continue
+        game_dir = os.path.join(steamapps, "common", m.group(1))
+        if not os.path.isdir(game_dir):
+            continue
+        try:
+            pending = [game_dir]
+            for depth in range(3):
+                next_dirs = []
+                for folder in pending:
+                    try:
+                        with os.scandir(folder) as entries:
+                            for entry in entries:
+                                name = entry.name.lower()
+                                if name in EAC_MARKERS:
+                                    return True
+                                if entry.is_dir(follow_symlinks=False):
+                                    if name in ("easyanticheat", "anticheat"):
+                                        return True
+                                    if depth < 2:
+                                        next_dirs.append(entry.path)
+                    except OSError:
+                        pass
+                pending = next_dirs
+                if not pending:
+                    break
+        except OSError:
+            pass
+    return False
+
+
 def native_targets(steam_root, apps):
     wanted = {str(app) for app in apps if str(app) not in NOT_GAMES}
     if not wanted:
@@ -879,6 +996,9 @@ def native_targets(steam_root, apps):
             targets[app] = NATIVE_CHOICE
             continue
         targets[app] = FEX_TOOL
+    for app in wanted:
+        if app not in targets and is_eac_installed(steam_root, app):
+            targets[app] = None
     return targets
 
 
@@ -1013,7 +1133,8 @@ def plan_mapping(current, installed, runnable, default, auto, native=None, picks
     changes, kept = {}, {}
     if current.get("0", "") != default:
         changes["0"] = default
-    for app in sorted((set(current) | installed | picks | set(auto) | set(overrides) | native_choices) - {"0"}, key=app_order):
+    candidates = (set(current) | installed | picks | set(auto) | set(overrides) | native_choices) - {"0"} - NOT_GAMES
+    for app in sorted(candidates, key=app_order):
         name = current.get(app, "")
         if app in overrides:
             target = overrides[app]
@@ -1067,8 +1188,8 @@ def picked_after(current, changes):
 
 def followers(state, current):
     if "auto" in state:
-        return state["auto"]
-    return {app: name for app, name in current.items() if app != "0" and name == TOOL}
+        return {app: name for app, name in state["auto"].items() if str(app) not in NOT_GAMES}
+    return {app: name for app, name in current.items() if app != "0" and str(app) not in NOT_GAMES and name == TOOL}
 
 
 def tool_entry(name, display, path, valve):
@@ -1098,6 +1219,23 @@ def tool_catalog(steam_root, extras=None):
     for name, entry in sorted(extras.items()):
         catalog.append(tool_entry(name, display_name(entry), os.path.join(tools, entry), False))
     return catalog
+
+
+def valve_tool_names(steam_root):
+    tools = set()
+    for library in libraries(steam_root):
+        common = os.path.join(library, "steamapps", "common")
+        try:
+            entries = os.listdir(common)
+        except OSError:
+            continue
+        for entry in entries:
+            vdf = os.path.join(common, entry, "compatibilitytool.vdf")
+            if os.path.isfile(vdf):
+                tool = first_key(vdf, ["compatibilitytools", "compat_tools"])
+                if tool:
+                    tools.add(tool)
+    return tools
 
 
 def requested_tool(request, catalog):
@@ -1143,9 +1281,9 @@ def now_ms():
     return int(time.time() * 1000)
 
 
-def choose_default(steam_default, state, request, catalog, adopt_steam=True, apply_request=True, now=None):
+def choose_default(steam_default, state, request, catalog, adopt_steam=True, apply_request=True, now=None, names=None):
     state = dict(state)
-    names = [t["name"] for t in catalog]
+    names = [t["name"] for t in catalog] if names is None else names
     seq = request.get("seq")
     seq = seq if isinstance(seq, int) else 0
     if apply_request and seq > int(state.get("applied", 0) or 0):
@@ -1294,16 +1432,16 @@ def register_default(config_path, apps=(), protect=(), default=None, catalog=Non
         if mapping is None:
             return state.get("default") or TOOL
         current = read_mapping(tokens, mapping)
+        steam_root = os.path.dirname(os.path.dirname(os.path.abspath(config_path)))
         if catalog is None:
-            catalog = tool_catalog(os.path.dirname(os.path.dirname(os.path.abspath(config_path))),
+            catalog = tool_catalog(steam_root,
                                    dict(protect) if isinstance(protect, dict) else {name: name for name in protect})
-        names = [t["name"] for t in catalog]
+        names = set(t["name"] for t in catalog) | set(state.get("known_tools", ())) | valve_tool_names(steam_root)
         if default is None:
             if settle:
-                default, state = choose_default(current.get("0", ""), state, read_json(state_path("request.json", directory)), catalog)
+                default, state = choose_default(current.get("0", ""), state, read_json(state_path("request.json", directory)), catalog, names=names)
             else:
                 default = state.get("default") if state.get("default") in names else TOOL
-        steam_root = os.path.dirname(os.path.dirname(os.path.abspath(config_path)))
         overrides = requested_games(game_requests(directory), catalog)
         managed = state.get("auto", {}).keys() if isinstance(state.get("auto"), dict) else ()
         native_choices = state.get("native_choices", ())
@@ -1465,6 +1603,8 @@ def main():
     extras = adopt_extras(tools)
     for name, directory in sorted(extras.items()):
         print("steam-compatibility: adopted %s as %s" % (directory, name))
+    for target in adopt_fex_tool(steam_root):
+        print("steam-compatibility: adopted Valve FEX tool at %s" % target)
     catalog = tool_catalog(steam_root, extras)
     config = os.path.join(steam_root, "config", "config.vdf")
     if live_helper_running():

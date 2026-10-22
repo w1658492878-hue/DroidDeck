@@ -555,20 +555,26 @@ class Helper:
             installed = COMPAT["installed_apps"](self.steam_root)
             self.installed = installed
             picks = COMPAT["valve_picks"](self.steam_root)
+            not_games = COMPAT["NOT_GAMES"]
             prior_auto = state.get("auto", {})
             if not isinstance(prior_auto, dict):
                 prior_auto = {}
+            prior_auto = {app: tool for app, tool in prior_auto.items() if str(app) not in not_games}
             # "native" from earlier builds also lists dual-platform games nobody chose to run natively.
             prior_native = state.get("native_choices", ())
-            native_choices = set(prior_native if isinstance(prior_native, (list, tuple, set)) else ())
+            native_choices = {app for app in (prior_native if isinstance(prior_native, (list, tuple, set)) else ())
+                              if str(app) not in not_games}
             picked = COMPAT["picked_apps"](state)
             runnable = {t["name"].lower() for t in live}
             apps = sorted(set(installed) | set(picks) | set(prior_auto) | native_choices, key=COMPAT["app_order"])
-            overrides = COMPAT["requested_games"](
-                COMPAT["game_requests"](), catalog, [t["name"] for t in live])
+            overrides = {
+                app: tool for app, tool in COMPAT["requested_games"](
+                    COMPAT["game_requests"](), catalog, [t["name"] for t in live]).items()
+                if str(app) not in not_games
+            }
             apps = sorted(set(apps) | set(overrides), key=COMPAT["app_order"])
             current = dict(page.compat("many(%s)" % json.dumps(apps)) or {})
-            refused = set(apps) - set(current)
+            refused = (set(apps) - set(current)) - {"0"}
             refused_native = native_choices & refused
             if refused:
                 apps = [app for app in apps if app not in refused]
@@ -601,7 +607,7 @@ class Helper:
                     elif not current.get(app):
                         current.pop(app, None)
             changes, auto = COMPAT["plan_mapping"](
-                current, installed, [t["name"] for t in live], default,
+                current, installed, set(t["name"] for t in live) | self.known, default,
                 COMPAT["followers"](state, current), native, picks, overrides,
                 prior_auto.keys(), native_choices)
             for app, tool in sorted(changes.items(), key=lambda item: COMPAT["app_order"](item[0])):
@@ -611,7 +617,9 @@ class Helper:
             state.update(
                 auto={app: tool for app, tool in auto.items() if tool is not COMPAT["NATIVE_CHOICE"]},
                 native_choices=sorted(refused_native | {app for app, tool in auto.items() if tool is COMPAT["NATIVE_CHOICE"]}),
-                picked=COMPAT["picked_after"](current, changes), tools=catalog, live=True)
+                known_tools=sorted(self.known),
+                picked=COMPAT["picked_after"](current, changes),
+                tools=catalog, live=True)
             state.pop("native", None)
             if waiting:
                 state["pending"] = wanted

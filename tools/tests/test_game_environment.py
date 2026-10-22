@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 BIN = Path(__file__).resolve().parents[1] / "linuxfs/overlay/usr/local/bin"
 MODULE = runpy.run_path(str(BIN / "droiddeck-game-env"))
@@ -326,6 +327,50 @@ class GameEnvironmentTest(unittest.TestCase):
                                             env=env, text=True, capture_output=True, check=True)
                     self.assertEqual(json.loads(result.stdout.strip()),
                                      ["waitforexitandrun", str(expected), "-arg"])
+                    if setting == "1":
+                        self.assertIn("started without Easy Anti-Cheat (offline only)", result.stderr)
+                        self.assertNotIn("Easy Anti-Cheat detected", result.stderr)
+                    else:
+                        self.assertIn("Easy Anti-Cheat detected", result.stderr)
+                        self.assertNotIn("started without Easy Anti-Cheat", result.stderr)
+            (game / "EasyAntiCheat/settings.json").write_text(json.dumps({"executable": "missing.exe"}))
+            config.write_text(json.dumps({"version": 1, "games": {"42": {"DROIDDECK_ANTICHEAT_OFFLINE": "1"}}}))
+            result = subprocess.run([sys.executable, str(BIN / "droiddeck-game-env"),
+                                     str(proton), "waitforexitandrun", str(bootstrapper), "-arg"],
+                                    env=env, text=True, capture_output=True, check=True)
+            self.assertEqual(json.loads(result.stdout.strip()),
+                             ["waitforexitandrun", str(bootstrapper), "-arg"])
+            self.assertIn("Easy Anti-Cheat detected", result.stderr)
+            self.assertNotIn("started without Easy Anti-Cheat", result.stderr)
+
+    def test_easy_anti_cheat_replacement_applies_engine_fixes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            game = home / "Arc Raiders"
+            (game / "EasyAntiCheat").mkdir(parents=True)
+            bootstrapper = game / "start_protected_game.exe"
+            target = game / "PioneerGame.exe"
+            bootstrapper.touch()
+            target.touch()
+            (game / "EasyAntiCheat/settings.json").write_text(json.dumps({"executable": "PioneerGame.exe"}))
+            proton = home / "fake-proton"
+            proton.write_text("#!" + sys.executable + "\nimport json, os, sys\nprint(json.dumps({\"argv\": sys.argv[1:], \"env\": dict(os.environ)}))\n")
+            proton.chmod(0o755)
+            config = home / ".config/droiddeck/game-environment.json"
+            config.parent.mkdir(parents=True)
+            config.write_text(json.dumps({"version": 1, "games": {"1808500": {"DROIDDECK_ANTICHEAT_OFFLINE": "1"}}}))
+            env = dict(os.environ, HOME=tmp, STEAM_COMPAT_DATA_PATH="/compatdata/1808500", SteamAppId="1808500")
+            result = subprocess.run([sys.executable, str(BIN / "droiddeck-game-env"),
+                                     str(proton), "waitforexitandrun", str(bootstrapper), "-arg"],
+                                    env=env, text=True, capture_output=True, check=True)
+            payload = json.loads(result.stdout.strip())
+            self.assertEqual(payload["argv"], [
+                "waitforexitandrun", str(target), "-arg",
+                "-noraytracing", "-ini:Engine:[/Script/Engine.RendererSettings]:r.RayTracing=False"
+            ])
+            self.assertIn("nodxr", payload["env"].get("VKD3D_CONFIG", ""))
+            self.assertIn("started without Easy Anti-Cheat (offline only)", result.stderr)
+            self.assertIn("Arc Raiders: ray tracing off", result.stderr)
 
     def test_deep_rock_gdk_avoids_the_raytracing_pipeline_crash(self):
         game = "/game/FSD/Binaries/WinGDK/FSD-WinGDK-Shipping.exe"
@@ -337,6 +382,23 @@ class GameEnvironmentTest(unittest.TestCase):
             self.assertEqual(MODULE["engine_fixes"](game, [choice]), ({}, [], []))
         self.assertEqual(MODULE["engine_fixes"]("/game/FSD-Win64-Shipping.exe", []), ({}, [], []))
         self.assertEqual(MODULE["engine_fixes"]("/game/Other-WinGDK-Shipping.exe", []), ({}, [], []))
+
+    def test_arc_raiders_avoids_raytracing_pipeline_crash(self):
+        for game in ("/game/Arc Raiders/PioneerGame.exe", "/game/Arc Raiders/PioneerGame-Win64-Shipping.exe"):
+            env, extra, notes = MODULE["engine_fixes"](game, [])
+            self.assertEqual(extra, ["-noraytracing", "-ini:Engine:[/Script/Engine.RendererSettings]:r.RayTracing=False"])
+            self.assertEqual(env, {"VKD3D_CONFIG": "nodxr"})
+            self.assertTrue(notes)
+            for choice in ("-raytracing", "-noraytracing"):
+                self.assertEqual(MODULE["engine_fixes"](game, [choice]), ({}, [], []))
+        self.assertEqual(MODULE["engine_fixes"]("/game/OtherGame.exe", []), ({}, [], []))
+        config = {"version": 1, "shared": {"VKD3D_CONFIG": "no_upload_hvv"}}
+        merged = MODULE["apply_config"]({}, config, "1808500", {"VKD3D_CONFIG": "nodxr"})
+        self.assertEqual(merged["VKD3D_CONFIG"], "no_upload_hvv,nodxr")
+        config_existing = {"version": 1, "shared": {"VKD3D_CONFIG": "no_upload_hvv,nodxr"}}
+        merged2 = MODULE["apply_config"]({}, config_existing, "1808500", {"VKD3D_CONFIG": "nodxr"})
+        self.assertEqual(merged2["VKD3D_CONFIG"], "no_upload_hvv,nodxr")
+
 
     def test_arkham_city_gets_full_x87_precision_over_the_preset(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -699,6 +761,23 @@ class ProtonDefaultTest(unittest.TestCase):
             finally:
                 globals_["native_targets"] = original_native_targets
 
+    def test_register_default_preserves_installed_valve_tools(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            steam = root / "Steam"
+            config = steam / "config/config.vdf"
+            config.parent.mkdir(parents=True)
+            steamapps = steam / "steamapps"
+            steamapps.mkdir()
+            proton_common = steamapps / "common" / "Proton 9.0 (Beta)"
+            proton_common.mkdir(parents=True)
+            (proton_common / "compatibilitytool.vdf").write_text(
+                '"compatibilitytools"\n{\n  "compat_tools"\n  {\n    "proton_9"\n    {\n      "install_path" "."\n    }\n  }\n}\n')
+            config.write_text(config_text([("0", self.TOOL), ("1808500", "proton_9")]))
+            COMPAT["register_default"](str(config), ["1808500"], catalog=self.CATALOG, directory=tmp)
+            self.assertEqual(mapping_of(config.read_text()), {"0": self.TOOL, "1808500": "proton_9"})
+
+
     def test_shortcuts_scanner_keeps_native_choice_for_unrelated_app_list(self):
         app, added_shortcut = "452280", "3537741571"
         with tempfile.TemporaryDirectory() as tmp:
@@ -832,6 +911,32 @@ class ProtonDefaultTest(unittest.TestCase):
         self.assertEqual(changes, {})
         self.assertEqual(auto, {})
 
+    def test_native_targets_excludes_eac_games_from_arm64_proton(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            steam = Path(tmp) / "Steam"
+            common = steam / "steamapps/common/Arc Raiders"
+            common.mkdir(parents=True)
+            (steam / "steamapps/appmanifest_1808500.acf").write_text('"AppState"\n{\n\t"appid"\t"1808500"\n\t"installdir"\t"Arc Raiders"\n}\n')
+            (common / "Installers").mkdir(parents=True)
+            (common / "Installers/AntiCheatInstaller.exe").touch()
+
+            globals_ = COMPAT["native_targets"].__globals__
+            original_platforms = globals_["appinfo_platforms"]
+            globals_["appinfo_platforms"] = lambda _path, wanted: {
+                "1808500": ({"windows"}, "x86_64", "game")
+            } if "1808500" in wanted else {}
+            try:
+                targets = COMPAT["native_targets"](str(steam), ["1808500"])
+                self.assertIn("1808500", targets)
+                self.assertIsNone(targets["1808500"])
+                changes, auto = COMPAT["plan_mapping"](
+                    {"0": "droiddeck-proton-arm64"}, ["1808500"], {"droiddeck-proton-arm64"}, "droiddeck-proton-arm64", {}, targets)
+                self.assertNotIn("1808500", changes)
+                self.assertNotIn("1808500", auto)
+            finally:
+                globals_["appinfo_platforms"] = original_platforms
+
+
     def test_native_arm64_keeps_explicit_runtime_fex_and_proton_profiles(self):
         fex = COMPAT["FEX_TOOL"]
         current = {
@@ -952,6 +1057,12 @@ class ProtonDefaultTest(unittest.TestCase):
             config.write_text(config_text([("0", "proton_experimental")]))
             default = COMPAT["register_default"](str(config), ["10"], catalog=self.CATALOG, directory=tmp)
             self.assertEqual(mapping_of(config.read_text()), {"0": "GE-Proton11-7", "10": "GE-Proton11-7"})
+
+            with mock.patch.dict(COMPAT["main"].__globals__, {"valve_tool_names": lambda root: {"proton_9"}}):
+                config.write_text(config_text([("0", "proton_9"), ("10", "proton_9")]))
+                default = COMPAT["register_default"](str(config), ["10"], catalog=self.CATALOG, directory=tmp, settle=True)
+                self.assertEqual(default, "proton_9")
+                self.assertEqual(mapping_of(config.read_text())["0"], "proton_9")
 
     def test_the_shortcut_writer_keeps_the_chosen_default(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1189,3 +1300,160 @@ class ForceSsbsTest(unittest.TestCase):
                 self.assertEqual(MODULE["force_ssbs"]([str(x86 / "proton")], on), on)
             finally:
                 g["SSBS_LIB"] = old
+
+    def test_anticheat_runtimes_and_eac_diagnostics(self):
+        import io
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            steam = root / ".local/share/Steam"
+            eac = steam / "steamapps/common/Proton EasyAntiCheat Runtime"
+            be = steam / "steamapps/common/Proton BattlEye Runtime"
+            arm = root / "arm"
+            (arm / "files/lib/wine/aarch64-unix").mkdir(parents=True)
+            x86 = root / "x86"
+            (x86 / "files/lib/wine/x86_64-unix").mkdir(parents=True)
+            game = root / "Arc Raiders"
+            (game / "EasyAntiCheat").mkdir(parents=True)
+            exe = game / "PioneerGame.exe"
+            exe.touch()
+
+            env = {"HOME": str(root)}
+            err = io.StringIO()
+            with mock.patch("sys.stderr", err):
+                got = MODULE["anticheat_runtimes"]([str(arm / "proton"), "waitforexitandrun", str(exe)], env)
+            self.assertNotIn("PROTON_EAC_RUNTIME", got)
+            self.assertIn("Proton EasyAntiCheat Runtime (1826330) is not installed", err.getvalue())
+
+            eac.mkdir(parents=True)
+            be.mkdir(parents=True)
+            err = io.StringIO()
+            with mock.patch("sys.stderr", err):
+                got = MODULE["anticheat_runtimes"]([str(arm / "proton"), "waitforexitandrun", str(exe)], env)
+            self.assertEqual(got["PROTON_EAC_RUNTIME"], str(eac))
+            self.assertEqual(got["PROTON_BATTLEYE_RUNTIME"], str(be))
+            self.assertIn("Easy Anti-Cheat detected on ARM64 Proton", err.getvalue())
+
+            err = io.StringIO()
+            with mock.patch("sys.stderr", err):
+                got = MODULE["anticheat_runtimes"]([str(x86 / "proton"), "waitforexitandrun", str(exe)], env)
+            self.assertEqual(got["PROTON_EAC_RUNTIME"], str(eac))
+            self.assertIn("Easy Anti-Cheat runtime ready", err.getvalue())
+
+            err = io.StringIO()
+            with mock.patch("sys.stderr", err):
+                got = MODULE["anticheat_runtimes"]([str(arm / "proton"), "waitforexitandrun", str(exe)], env, eac_offline=True)
+            self.assertEqual(got["PROTON_EAC_RUNTIME"], str(eac))
+            self.assertNotIn("Easy Anti-Cheat detected", err.getvalue())
+
+            xdg = root / "xdg"
+            xdg_eac = xdg / "Steam/steamapps/common/Proton EasyAntiCheat Runtime"
+            xdg_eac.mkdir(parents=True)
+            sd = root / "sd"
+            sd_be = sd / "steamapps/common/Proton BattlEye Runtime"
+            sd_be.mkdir(parents=True)
+            g = MODULE["steam_libraries"].__globals__
+            old_sd = g["SD_LIBRARY"]
+            g["SD_LIBRARY"] = str(sd)
+            try:
+                with mock.patch("sys.stderr", io.StringIO()):
+                    got = MODULE["anticheat_runtimes"](
+                        [str(x86 / "proton"), "waitforexitandrun", str(exe)],
+                        {"HOME": str(root / "empty-home"), "XDG_DATA_HOME": str(xdg)},
+                    )
+                self.assertEqual(got["PROTON_EAC_RUNTIME"], str(xdg_eac))
+                self.assertEqual(got["PROTON_BATTLEYE_RUNTIME"], str(sd_be))
+            finally:
+                g["SD_LIBRARY"] = old_sd
+
+            proton = x86 / "proton"
+            proton.write_text(
+                "#!" + sys.executable + "\nimport os, sys\nprint(os.environ.get('PROTON_EAC_RUNTIME', ''))\n"
+            )
+            proton.chmod(0o755)
+            sub_env = {
+                k: v for k, v in os.environ.items()
+                if k not in (
+                    "BL_X64_STEAM_ROOT",
+                    "STEAM_COMPAT_CLIENT_INSTALL_PATH",
+                    "PROTON_EAC_RUNTIME",
+                    "PROTON_BATTLEYE_RUNTIME",
+                )
+            }
+            sub_env.update(HOME=str(root), XDG_DATA_HOME=str(root / ".local/share"), SteamAppId="1808500")
+            proc = subprocess.run(
+                [sys.executable, str(BIN / "droiddeck-game-env"), str(proton), "waitforexitandrun", str(exe)],
+                env=sub_env,
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.stdout.strip(), str(eac))
+            self.assertIn("Easy Anti-Cheat runtime ready", proc.stderr)
+
+    def test_nested_game_files_and_anticheat_detection(self):
+        import io
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            steam = root / ".local/share/Steam"
+            eac = steam / "steamapps/common/Proton EasyAntiCheat Runtime"
+            eac.mkdir(parents=True)
+            arm = root / "arm"
+            (arm / "files/lib/wine/aarch64-unix").mkdir(parents=True)
+            x86 = root / "x86"
+            (x86 / "files/lib/wine/x86_64-unix").mkdir(parents=True)
+
+            game_root = root / "Arc Raiders"
+            binaries = game_root / "PioneerGame/Binaries/Win64"
+            binaries.mkdir(parents=True)
+            exe = binaries / "PioneerGame.exe"
+            exe.touch()
+            installers = game_root / "Installers"
+            installers.mkdir(parents=True)
+            (installers / "AntiCheatInstaller.exe").touch()
+
+            self.assertIn("anticheatinstaller.exe", MODULE["game_tree_files"](str(exe)))
+
+            env = {"HOME": str(root)}
+            err = io.StringIO()
+            with mock.patch("sys.stderr", err):
+                got = MODULE["anticheat_runtimes"]([str(arm / "proton"), "waitforexitandrun", str(exe)], env)
+            self.assertEqual(got["PROTON_EAC_RUNTIME"], str(eac))
+            self.assertIn("Easy Anti-Cheat detected on ARM64 Proton; Linux easyanticheat_x64.so is x86_64-only and requires an x86_64 Proton tool under FEX", err.getvalue())
+
+            err = io.StringIO()
+            with mock.patch("sys.stderr", err):
+                got = MODULE["anticheat_runtimes"]([str(x86 / "proton"), "waitforexitandrun", str(exe)], env)
+            self.assertEqual(got["PROTON_EAC_RUNTIME"], str(eac))
+            self.assertIn("Easy Anti-Cheat runtime ready", err.getvalue())
+
+    def test_sibling_game_eac_marker_does_not_trigger_diagnostic(self):
+        import io
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            common = root / ".local/share/Steam/steamapps/common"
+            game_a = common / "NormalGame"
+            game_a_bin = game_a / "Binaries/Win64"
+            game_a_bin.mkdir(parents=True)
+            game_a_exe = game_a_bin / "NormalGame.exe"
+            game_a_exe.touch()
+
+            sibling = common / "SiblingGame/EasyAntiCheat"
+            sibling.mkdir(parents=True)
+            (sibling / "easyanticheat_x64.so").touch()
+
+            tree = MODULE["game_tree_files"](str(game_a_exe))
+            self.assertNotIn("easyanticheat_x64.so", tree)
+
+            arm = root / "arm"
+            (arm / "files/lib/wine/aarch64-unix").mkdir(parents=True)
+            err = io.StringIO()
+            with mock.patch("sys.stderr", err):
+                got = MODULE["anticheat_runtimes"]([str(arm / "proton"), "waitforexitandrun", str(game_a_exe)], {"HOME": str(root)})
+            self.assertNotIn("PROTON_EAC_RUNTIME", got)
+            self.assertNotIn("Easy Anti-Cheat detected", err.getvalue())
+
+

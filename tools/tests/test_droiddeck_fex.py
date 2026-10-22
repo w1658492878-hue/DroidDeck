@@ -5,7 +5,10 @@ import json
 import os
 import runpy
 import shutil
+import socket
 import struct
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -45,6 +48,7 @@ class FexTestCase(unittest.TestCase):
             "WANTED": str(self.home / ".config/droiddeck/fex-wanted"),
             "PRELOADS": str(self.tmp / "preloads"),
             "HOST_PRELOAD": str(self.tmp / "ld.so.preload"),
+            "GAME_ENVIRONMENT": str(self.home / ".config/droiddeck/game-environment.json"),
             "DEVICE_FONTS": str(self.tmp / "android-fonts"),
             "FONT_RULES": str(self.tmp / "66-droiddeck-device-fonts.conf"),
         }
@@ -573,6 +577,295 @@ class LaunchTest(FexTestCase):
         guest = FEX["guest_environment"]({"portable": True}, {"XDG_RUNTIME_DIR": str(self.tmp / "missing")})
         self.assertEqual(guest["FEX_APP_DATA_LOCATION"], G["DATA_DIR"] + "/")
 
+    def test_shorten_compat_path_and_socket_cleanup(self):
+        short_base = self.tmp / "c"
+        with mock.patch.dict(G, {"COMPAT_SHORT_BASE": str(short_base)}):
+            compat = self.tmp / "compatdata/1808500"
+            server = compat / "fex-emu/Server"
+            server.mkdir(parents=True)
+            dead_socket = server / "10114.FEXServer.Socket"
+            dead_socket.touch()
+            other_file = server / "keep.txt"
+            other_file.touch()
+
+            live_socket_path = str(server / "live.FEXServer.Socket")
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as live_sock:
+                live_sock.bind(live_socket_path)
+                live_sock.listen(1)
+
+                short = FEX["shorten_compat_path"](str(compat))
+                self.assertTrue(os.path.islink(short))
+                self.assertEqual(os.path.realpath(short), str(compat.resolve()))
+                self.assertTrue(os.path.islink(compat / "fex-emu"))
+                self.assertEqual(os.path.realpath(compat / "fex-emu"), str((short_base / "f1808500").resolve()))
+                self.assertFalse(dead_socket.exists())
+                self.assertTrue(os.path.exists(live_socket_path))
+                canonical_sock = os.path.realpath(os.path.join(short, "fex-emu", "Server", "10114.FEXServer.Socket"))
+                self.assertTrue(canonical_sock.startswith(str((short_base / "f1808500" / "Server").resolve())))
+                host_sock = "/data/user/0/com.droiddeck.launcher/files/linuxfs" + canonical_sock[len(str(self.tmp.resolve())):]
+                self.assertLessEqual(len(host_sock), 108)
+
+                unrelated = self.tmp / "compatdata_other"
+                unrelated.mkdir(parents=True)
+                short_unrelated = FEX["shorten_compat_path"](str(unrelated))
+                self.assertNotEqual(short_unrelated, str(unrelated))
+                self.assertTrue(short_unrelated.startswith(str(short_base)))
+                self.assertTrue((unrelated / "fex-emu/Server").is_dir())
+
+                collision_target = self.tmp / "compatdata/collision"
+                collision_short = short_base / "collision"
+                collision_short.touch()
+                with self.assertRaises(OSError):
+                    FEX["shorten_compat_path"](str(collision_target))
+                collision_short.unlink()
+
+                collision_short.mkdir()
+                res = FEX["shorten_compat_path"](str(collision_target))
+                self.assertTrue(os.path.islink(res))
+                self.assertEqual(os.path.realpath(res), str(collision_target.resolve()))
+
+            fex = {"portable": False}
+            env = {"STEAM_COMPAT_DATA_PATH": str(compat)}
+            guest = FEX["guest_environment"](fex, env)
+            self.assertEqual(guest["STEAM_COMPAT_DATA_PATH"], short)
+
+    def test_shorten_compat_path_handles_concurrent_file_exists(self):
+        short_base = self.tmp / "c_concurrent"
+        with mock.patch.dict(G, {"COMPAT_SHORT_BASE": str(short_base)}):
+            compat = self.tmp / "compatdata/concurrent_app"
+            orig_symlink = os.symlink
+            called = [0]
+
+            def race_symlink(src, dst):
+                called[0] += 1
+                if called[0] == 1:
+                    orig_symlink(src, dst)
+                    raise FileExistsError(17, "File exists", dst)
+                return orig_symlink(src, dst)
+
+            with mock.patch("os.symlink", side_effect=race_symlink):
+                res = FEX["shorten_compat_path"](str(compat))
+                self.assertTrue(os.path.islink(res))
+                self.assertEqual(os.path.realpath(res), str(compat.resolve()))
+
+    def test_game_environment_invalid_config_does_not_skip_anticheat_runtimes(self):
+        steam = self.tmp / ".local/share/Steam"
+        eac = steam / "steamapps/common/Proton EasyAntiCheat Runtime"
+        eac.mkdir(parents=True)
+        game = self.tmp / "Game"
+        (game / "EasyAntiCheat").mkdir(parents=True)
+        exe = game / "Game.exe"
+        exe.touch()
+        proton = self.tmp / "Proton/proton"
+        proton.parent.mkdir(parents=True)
+        proton.touch()
+
+        invalid_cfg = self.tmp / "bad_env.json"
+        invalid_cfg.write_text("{this is not valid json")
+
+        with mock.patch.dict(G, {"GAME_ENVIRONMENT": str(invalid_cfg)}):
+            env = {"HOME": str(self.tmp), "SteamAppId": "1808500"}
+            command = [str(proton), "waitforexitandrun", str(exe)]
+            result = FEX["game_environment"](command, env)
+            self.assertEqual(result.get("PROTON_EAC_RUNTIME"), str(eac))
+
+    def test_steam_action_unwraps_entry_point_and_runs_game_env(self):
+        proton = self.tmp / "Proton/proton"
+        proton.parent.mkdir(parents=True)
+        proton.write_text("#!/usr/bin/python3\n")
+        proton.chmod(0o755)
+
+        orig = self.tmp / "fex-compat-tool.droiddeck-orig"
+        orig.write_text("#!/bin/sh\n")
+        orig.chmod(0o755)
+
+        launched = []
+        old_launch = G["launch"]
+        G["launch"] = lambda cmd, env, mode: launched.append((cmd, env, mode)) or 0
+        try:
+            with mock.patch("os.execvpe") as execvpe:
+                FEX["main"](["valve-fex", str(orig), "waitforexitandrun", "--", "/runtime/_v2-entry-point", "--verb=waitforexitandrun", "--", str(proton), "waitforexitandrun", "Game.exe"])
+                execvpe.assert_called_once()
+                self.assertEqual(execvpe.call_args[0][0], str(orig))
+                self.assertEqual(execvpe.call_args[0][1], [str(orig), "waitforexitandrun", "--", str(proton), "waitforexitandrun", "Game.exe"])
+
+            log_file = self.tmp / "probe.log"
+            probe = self.tmp / "probe"
+            probe.write_text(
+                f"#!{sys.executable}\n"
+                "import os, sys, json\n"
+                f"with open({repr(str(log_file))}, 'w') as f:\n"
+                "    json.dump({'argv': sys.argv, 'compat': os.environ.get('STEAM_COMPAT_DATA_PATH')}, f)\n"
+                "sys.exit(42)\n"
+            )
+            probe.chmod(0o755)
+
+            short_base = self.tmp / "c"
+            sub_env = dict(
+                os.environ,
+                HOME=str(self.home),
+                DROIDDECK_COMPAT_SHORT_BASE=str(short_base),
+                STEAM_COMPAT_DATA_PATH=str(self.tmp / "compatdata/1808500"),
+            )
+            res = subprocess.run(
+                [sys.executable, str(BIN / "droiddeck-fex"), "valve-fex", str(probe),
+                 "waitforexitandrun", "--", "/runtime/_v2-entry-point", "--verb=waitforexitandrun", "--",
+                 str(proton), "waitforexitandrun", "Game.exe"],
+                env=sub_env, capture_output=True, text=True
+            )
+            self.assertEqual(res.returncode, 42)
+            payload = json.loads(log_file.read_text())
+            self.assertEqual(payload["argv"], [str(probe), "waitforexitandrun", "--", str(proton), "waitforexitandrun", "Game.exe"])
+            self.assertTrue(payload["compat"].startswith(str(short_base)))
+
+            FEX["main"](["steam", "waitforexitandrun", "--", str(proton), "waitforexitandrun", "Game.exe"])
+            self.assertEqual(launched[-1][0], [str(proton), "waitforexitandrun", "Game.exe"])
+            self.assertEqual(launched[-1][2], "on")
+
+            FEX["main"](["steam", "waitforexitandrun", "--", "/runtime/_v2-entry-point", "--verb=waitforexitandrun", "--", str(proton), "waitforexitandrun", "Game.exe"])
+            self.assertEqual(launched[-1][0], [str(proton), "waitforexitandrun", "Game.exe"])
+            self.assertEqual(launched[-1][2], "on")
+
+            game_x86 = self.tmp / "game.x86_64"
+            game_x86.touch()
+            FEX["main"](["steam", "waitforexitandrun", "--", str(game_x86)])
+            self.assertEqual(launched[-1][0], [str(game_x86)])
+            self.assertEqual(launched[-1][2], "auto")
+        finally:
+            G["launch"] = old_launch
+
+    def test_fex_applies_engine_fixes_arguments_and_env(self):
+        proton = self.tmp / "Proton/proton"
+        proton.parent.mkdir(parents=True)
+        proton.write_text("#!/usr/bin/python3\n")
+        proton.chmod(0o755)
+
+        orig = self.tmp / "fex-compat-tool.droiddeck-orig"
+        orig.write_text("#!/bin/sh\n")
+        orig.chmod(0o755)
+
+        import io
+        err = io.StringIO()
+        with mock.patch("os.execvpe") as execvpe, mock.patch("sys.stderr", err):
+            with mock.patch.dict(os.environ, {"SteamAppId": "1808500"}):
+                FEX["main"]([
+                    "valve-fex", str(orig), "waitforexitandrun", "--",
+                    str(proton), "waitforexitandrun", "/game/Arc Raiders/PioneerGame.exe"
+                ])
+            execvpe.assert_called_once()
+            called_argv = execvpe.call_args[0][1]
+            called_env = execvpe.call_args[0][2]
+            self.assertEqual(called_argv, [
+                str(orig), "waitforexitandrun", "--", str(proton), "waitforexitandrun",
+                "/game/Arc Raiders/PioneerGame.exe",
+                "-noraytracing", "-ini:Engine:[/Script/Engine.RendererSettings]:r.RayTracing=False"
+            ])
+            self.assertIn("nodxr", called_env.get("VKD3D_CONFIG", ""))
+            self.assertIn("Arc Raiders: ray tracing off", err.getvalue())
+
+    def test_fex_applies_engine_fixes_when_offline_anticheat_replaces_executable(self):
+        proton = self.tmp / "Proton/proton"
+        proton.parent.mkdir(parents=True, exist_ok=True)
+        proton.write_text("#!/usr/bin/python3\n")
+        proton.chmod(0o755)
+
+        orig = self.tmp / "fex-compat-tool.droiddeck-orig"
+        orig.write_text("#!/bin/sh\n")
+        orig.chmod(0o755)
+
+        game_dir = self.tmp / "Arc Raiders"
+        (game_dir / "EasyAntiCheat").mkdir(parents=True, exist_ok=True)
+        bootstrapper = game_dir / "start_protected_game.exe"
+        target = game_dir / "PioneerGame.exe"
+        bootstrapper.touch()
+        target.touch()
+        (game_dir / "EasyAntiCheat/settings.json").write_text(json.dumps({"executable": "PioneerGame.exe"}))
+
+        config_path = self.home / ".config/droiddeck/game-environment.json"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(json.dumps({
+            "version": 1,
+            "games": {"1808500": {"DROIDDECK_ANTICHEAT_OFFLINE": "1"}}
+        }))
+
+        import io
+        err = io.StringIO()
+        with mock.patch("os.execvpe") as execvpe, mock.patch("sys.stderr", err):
+            with mock.patch.dict(os.environ, {"SteamAppId": "1808500"}):
+                FEX["main"]([
+                    "valve-fex", str(orig), "waitforexitandrun", "--",
+                    str(proton), "waitforexitandrun", str(bootstrapper)
+                ])
+            execvpe.assert_called_once()
+            called_argv = execvpe.call_args[0][1]
+            called_env = execvpe.call_args[0][2]
+            self.assertEqual(called_argv, [
+                str(orig), "waitforexitandrun", "--", str(proton), "waitforexitandrun",
+                str(target),
+                "-noraytracing", "-ini:Engine:[/Script/Engine.RendererSettings]:r.RayTracing=False"
+            ])
+            self.assertIn("nodxr", called_env.get("VKD3D_CONFIG", ""))
+            self.assertIn("started without Easy Anti-Cheat (offline only)", err.getvalue())
+            self.assertIn("Arc Raiders: ray tracing off", err.getvalue())
+
+    def test_fex_directories_prepended_to_path(self):
+        fex = {"portable": True, "server": "/opt/fex/bin/FEXServer", "bin": "/opt/fex/bin/FEX"}
+        guest = FEX["guest_environment"](fex, {"PATH": "/usr/bin:/bin"})
+        self.assertEqual(guest["PATH"], "/opt/fex/bin:/usr/bin:/bin")
+
+    def test_path_deduplication_and_priority_removes_later_occurrences(self):
+        fex = {"portable": True, "server": "/opt/fex/server/FEXServer", "bin": "/opt/fex/bin/FEX"}
+        guest = FEX["guest_environment"](fex, {"PATH": "/usr/bin:/opt/fex/server:/opt/fex/bin:/bin:/opt/fex/server"})
+        self.assertEqual(guest["PATH"], "/opt/fex/server:/opt/fex/bin:/usr/bin:/bin")
+
+    def test_locked_aborts_when_all_lock_paths_fail(self):
+        with mock.patch("builtins.open", side_effect=OSError("Permission denied")):
+            with self.assertRaises(OSError):
+                with FEX["locked"]():
+                    pass
+
+    def test_prepare_aborts_safely_when_lock_fails(self):
+        with mock.patch.dict(G, {"locked": mock.MagicMock(side_effect=OSError("Locked out"))}):
+            fex, said = self.quiet(FEX["prepare"])
+            self.assertIsNone(fex)
+            self.assertIn("could not prepare x86 runtime", said)
+
+    def test_write_config_propagates_oserror_and_aborts_prepare(self):
+        self.fex_tool()
+        self.runtime()
+        with mock.patch.dict(G, {"write_config": mock.MagicMock(side_effect=OSError("Disk full"))}):
+            fex, said = self.quiet(FEX["prepare"])
+            self.assertIsNone(fex)
+            self.assertIn("could not prepare x86 runtime (Disk full)", said)
+
+    def test_valve_fex_delegation_passes_guest_environment_and_path(self):
+        proton = self.tmp / "Proton/proton"
+        proton.parent.mkdir(parents=True)
+        proton.write_text("#!/usr/bin/python3\n")
+        proton.chmod(0o755)
+
+        orig = self.tmp / "fex-compat-tool.droiddeck-orig"
+        orig.write_text("#!/bin/sh\n")
+        orig.chmod(0o755)
+
+        fake_fex = {
+            "bin": "/opt/fex/bin/FEX",
+            "server": "/opt/fex/bin/FEXServer",
+            "portable": True,
+            "rootfs": "/opt/rootfs",
+            "host_thunks": "/opt/h",
+            "guest_thunks": "/opt/g",
+            "thunks_db": "/opt/db",
+        }
+        with mock.patch.dict(G, {"prepare": lambda *args, **kwargs: fake_fex}), mock.patch("os.execvpe") as execvpe:
+            FEX["main"](["valve-fex", str(orig), "waitforexitandrun", "--", str(proton), "waitforexitandrun", "Game.exe"])
+            execvpe.assert_called_once()
+            passed_env = execvpe.call_args[0][2]
+            self.assertEqual(passed_env.get("FEX_ROOTFS"), "/opt/rootfs")
+            self.assertEqual(passed_env.get("FEX_PORTABLE"), "1")
+            self.assertTrue(passed_env.get("PATH", "").startswith("/opt/fex/bin"))
+            self.assertEqual(passed_env.get("FEX_THUNKHOSTLIBS"), "/opt/h")
+
     def test_the_runtime_and_thunks_are_passed_to_fex(self):
         fex = {"portable": True, "rootfs": "/rt/files", "host_thunks": "/h", "guest_thunks": "/g", "thunks_db": "/db"}
         guest = FEX["guest_environment"](fex, {})
@@ -855,6 +1148,20 @@ class AppInfoTest(unittest.TestCase):
         self.assertEqual(changes, {})
         self.assertEqual(auto, {})
 
+    def test_plan_mapping_excludes_not_games(self):
+        tool = self.COMPAT["TOOL"]
+        current = {"0": tool, "1245040": "proton_5", "1628350": "sniper", "42": "proton_5"}
+        installed = ["1245040", "1628350", "42"]
+        changes, auto = self.COMPAT["plan_mapping"](
+            current, installed, [tool], tool, {}
+        )
+        self.assertNotIn("1245040", changes)
+        self.assertNotIn("1628350", changes)
+        self.assertNotIn("1245040", auto)
+        self.assertNotIn("1628350", auto)
+        self.assertEqual(changes.get("42"), tool)
+        self.assertEqual(auto.get("42"), tool)
+
     def test_the_tool_files(self):
         with tempfile.TemporaryDirectory() as tmp:
             tool = Path(tmp) / "droiddeck-fex"
@@ -865,6 +1172,45 @@ class AppInfoTest(unittest.TestCase):
             vdf = (tool / "compatibilitytool.vdf").read_text()
             self.assertIn('"from_oslist" "linux"', vdf)
             self.assertIn('"to_oslist" "linux"', vdf)
+
+    def test_adopt_fex_tool(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            steam = Path(tmp) / "Steam"
+            fex_dir = steam / "steamapps/common/FEX-Emu"
+            fex_dir.mkdir(parents=True)
+            tool = fex_dir / self.COMPAT["VALVE_FEX_TOOL"]
+            tool.write_text("#!/bin/bash\noriginal FEX tool\n")
+            tool.chmod(0o755)
+            adopted = self.COMPAT["adopt_fex_tool"](str(steam))
+            self.assertEqual(adopted, [str(tool)])
+            orig = tool.with_name(self.COMPAT["VALVE_FEX_TOOL"] + self.COMPAT["ORIGINAL_SUFFIX"])
+            self.assertEqual(orig.read_text(), "#!/bin/bash\noriginal FEX tool\n")
+            self.assertEqual(tool.read_text(), self.COMPAT["VALVE_FEX_WRAPPER_SH"])
+            self.assertTrue(os.access(tool, os.X_OK))
+
+            adopted2 = self.COMPAT["adopt_fex_tool"](str(steam))
+            self.assertEqual(adopted2, [str(tool)])
+            self.assertEqual(orig.read_text(), "#!/bin/bash\noriginal FEX tool\n")
+            self.assertEqual(tool.read_text(), self.COMPAT["VALVE_FEX_WRAPPER_SH"])
+
+            tool.write_text("#!/bin/bash\nupdated FEX tool v2\n")
+            tool.chmod(0o755)
+            adopted3 = self.COMPAT["adopt_fex_tool"](str(steam))
+            self.assertEqual(adopted3, [str(tool)])
+            self.assertEqual(orig.read_text(), "#!/bin/bash\nupdated FEX tool v2\n")
+            self.assertEqual(tool.read_text(), self.COMPAT["VALVE_FEX_WRAPPER_SH"])
+
+            real_open = open
+
+            def open_mock(file, *args, **kwargs):
+                if str(file) == str(tool):
+                    raise OSError("permission denied")
+                return real_open(file, *args, **kwargs)
+
+            with mock.patch("builtins.open", side_effect=open_mock):
+                adopted_err = self.COMPAT["adopt_fex_tool"](str(steam))
+                self.assertEqual(adopted_err, [])
+                self.assertEqual(orig.read_text(), "#!/bin/bash\nupdated FEX tool v2\n")
 
 
 if __name__ == "__main__":

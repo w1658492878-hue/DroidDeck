@@ -56,6 +56,31 @@ def game_files(exe):
     return names
 
 
+def game_tree_files(exe):
+    names = set(game_files(exe))
+    folder = os.path.dirname(os.path.abspath(exe))
+    for _ in range(3):
+        if os.path.basename(folder).lower() == "common":
+            break
+        parent = os.path.dirname(folder)
+        if not parent or parent == folder or os.path.basename(parent).lower() == "common":
+            break
+        folder = parent
+        try:
+            with os.scandir(folder) as it:
+                for entry in it:
+                    names.add(entry.name.lower())
+                    if entry.is_dir(follow_symlinks=False):
+                        try:
+                            with os.scandir(entry.path) as inner:
+                                names.update(e.name.lower() for e in inner)
+                        except OSError:
+                            pass
+        except OSError:
+            pass
+    return names
+
+
 class Game:
     """What a fix gets to look at: the executable, its launch arguments and the files beside it."""
 
@@ -104,6 +129,12 @@ def godot_sentry(game):
 def deep_rock_gdk_raytracing(game):
     if game.stem == "fsd-wingdk-shipping" and not any(game.has_arg(arg) for arg in ("-raytracing", "-noraytracing")):
         return {}, ["-noraytracing", "-ini:Engine:[/Script/Engine.RendererSettings]:r.RayTracing=False"], "Deep Rock Galactic GDK: ray tracing off (D3D12 pipeline creation fails on Thor)"
+
+
+@fix
+def arc_raiders_raytracing(game):
+    if game.stem in ("pioneergame", "pioneergame-win64-shipping") and not any(game.has_arg(arg) for arg in ("-raytracing", "-noraytracing")):
+        return {"VKD3D_CONFIG": "nodxr"}, ["-noraytracing", "-ini:Engine:[/Script/Engine.RendererSettings]:r.RayTracing=False"], "Arc Raiders: ray tracing off (D3D12 pipeline creation / black screen on Turnip)"
 
 
 @fix
@@ -204,6 +235,13 @@ def apply_config(env, config, app_id, fixes=None):
     for name, value in (fixes or {}).items():
         if name == "WINEDLLOVERRIDES" and entries.get(name, env.get(name)):
             value = entries.get(name, env.get(name)) + ";" + value
+        elif name == "VKD3D_CONFIG" and entries.get(name, env.get(name)):
+            current_parts = [p.strip() for p in entries.get(name, env.get(name)).split(",") if p.strip()]
+            new_parts = [p.strip() for p in value.split(",") if p.strip()]
+            for part in new_parts:
+                if part not in current_parts:
+                    current_parts.append(part)
+            value = ",".join(current_parts)
         entries[name] = value
     entries.update(config.get("games", {}).get(app_id, {}))
     for name, value in entries.items():
@@ -423,6 +461,63 @@ def start(launch, launch_env, digest):
     return os.execvpe(launch[0], launch, launch_env)
 
 
+ANTICHEAT_RUNTIMES = (
+    ("PROTON_EAC_RUNTIME", "Proton EasyAntiCheat Runtime"),
+    ("PROTON_BATTLEYE_RUNTIME", "Proton BattlEye Runtime"),
+)
+EAC_MARKERS = frozenset((
+    "easyanticheat",
+    "start_protected_game.exe",
+    "easyanticheat_eos.dll",
+    "easyanticheat_x64.dll",
+    "easyanticheat_x86.dll",
+    "anticheatinstaller.exe",
+    "easyanticheat_setup.exe",
+    "easyanticheat.exe",
+))
+
+
+SD_LIBRARY = "/mnt/droiddeck-sd"
+
+
+def steam_libraries(env):
+    home = env.get("HOME") or str(Path.home())
+    data_home = env.get("XDG_DATA_HOME") or os.path.join(home, ".local/share")
+    root = env.get("BL_X64_STEAM_ROOT") or env.get("STEAM_COMPAT_CLIENT_INSTALL_PATH") or os.path.join(data_home, "Steam")
+    found = [root]
+    try:
+        with open(os.path.join(root, "steamapps", "libraryfolders.vdf"), encoding="utf-8", errors="replace") as f:
+            found += [path.replace("\\\\", "\\") for path in re.findall(r'"path"\s+"((?:[^"\\]|\\.)*)"', f.read())]
+    except OSError:
+        pass
+    found.append(SD_LIBRARY)
+    return list(dict.fromkeys(found))
+
+
+def anticheat_runtimes(command, env, eac_offline=False):
+    libraries = None
+    for key, folder in ANTICHEAT_RUNTIMES:
+        if env.get(key):
+            continue
+        if libraries is None:
+            libraries = steam_libraries(env)
+        for library in libraries:
+            candidate = os.path.join(library, "steamapps", "common", folder)
+            if os.path.isdir(candidate):
+                env = dict(env, **{key: candidate})
+                break
+    if not eac_offline and len(command) > 2 and command[1] == "waitforexitandrun" and (game_tree_files(command[2]) & EAC_MARKERS):
+        eac = env.get("PROTON_EAC_RUNTIME", "")
+        proton = os.path.dirname(command[0]) if command else ""
+        if not eac or not os.path.isdir(eac):
+            print("droiddeck-game-env: Easy Anti-Cheat detected, but Proton EasyAntiCheat Runtime (1826330) is not installed", file=sys.stderr)
+        elif os.path.isdir(os.path.join(proton, "files/lib/wine/aarch64-unix")):
+            print("droiddeck-game-env: Easy Anti-Cheat detected on ARM64 Proton; Linux easyanticheat_x64.so is x86_64-only and requires an x86_64 Proton tool under FEX", file=sys.stderr)
+        else:
+            print("droiddeck-game-env: Easy Anti-Cheat runtime ready (%s)" % eac, file=sys.stderr)
+    return env
+
+
 def main():
     command = sys.argv[1:]
     if not command:
@@ -438,10 +533,24 @@ def main():
     except OSError:
         digest = None
     app_id = game_id(env)
+    eac_offline = False
     if app_id:
         waiting = len(command) > 1 and command[1] == "waitforexitandrun"
         fixes = {}
+        path = Path.home() / ".config/droiddeck/game-environment.json"
+        try:
+            with path.open(encoding="utf-8") as source:
+                config = json.load(source)
+        except FileNotFoundError:
+            config = {"version": 1}
+        except (OSError, ValueError, TypeError, AttributeError):
+            print("droiddeck-game-env: invalid configuration; using inherited environment", file=sys.stderr)
+            config = {"version": 1}
         if waiting:
+            env = apply_config(env, config, app_id)
+            offline_command = offline_without_anticheat(command, env)
+            eac_offline = offline_command != command
+            command = offline_command
             command = skip_red_launcher(command)
             fixes, extra, notes = engine_fixes(command[2], command[3:]) if len(command) > 2 else ({}, [], [])
             for note in notes:
@@ -451,23 +560,12 @@ def main():
             if components:
                 own = fixes.get("WINEDLLOVERRIDES")
                 fixes["WINEDLLOVERRIDES"] = components + ";" + own if own else components
-        path = Path.home() / ".config/droiddeck/game-environment.json"
-        try:
-            with path.open(encoding="utf-8") as source:
-                config = json.load(source)
-            if waiting:
-                env = apply_config(env, config, app_id, fixes)
-            else:
-                env = apply_config(env, sync_config(config, app_id), app_id)
-        except FileNotFoundError:
-            if waiting:
-                env = apply_config(env, {"version": 1}, app_id, fixes)
-        except (OSError, ValueError, TypeError, AttributeError):
-            print("droiddeck-game-env: invalid configuration; using inherited environment", file=sys.stderr)
-    if app_id and len(command) > 1 and command[1] == "waitforexitandrun":
-        command = offline_without_anticheat(command, env)
+            env = apply_config(env, config, app_id, fixes)
+        else:
+            env = apply_config(env, sync_config(config, app_id), app_id)
     if mic_enabled == "0":
         env["BANNER_AUDIO_DIRECT_MIC"] = "0"
+    env = anticheat_runtimes(command, env, eac_offline=eac_offline)
     env = force_ssbs(command, env)
     try:
         xbox = runpy.run_path(str(Path(__file__).with_name("droiddeck-xbox")))

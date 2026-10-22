@@ -647,6 +647,50 @@ class ReconcileTest(unittest.TestCase):
         LIVE["detach"]()
         self.assertFalse(COMPAT["live_helper_running"]())
 
+    def test_valve_tools_and_rejected_apps_are_ignored_live(self):
+        for app in ("1245040", "1826330", "1161040", "999"):
+            (self.steam / ("steamapps/appmanifest_%s.acf" % app)).write_text("")
+        (self.state / "state.json").write_text(json.dumps({
+            "default": TOOL,
+            "auto": {"10": TOOL, "1245040": TOOL, "999": TOOL},
+        }))
+        (self.state / "games.json").write_text(json.dumps({
+            "version": 1,
+            "games": {
+                "1245040": None,
+                "1826330": {"valve": True, "dir": "Proton Experimental (ARM64)"},
+            },
+        }))
+        page = FakePage({"0": TOOL, "10": TOOL, "11": "proton_experimental"}, [TOOL, TOOL_11])
+        many = page.compat
+        queried = []
+
+        def compat(call):
+            if call.startswith("many("):
+                queried.extend(json.loads("[%s]" % call.partition("(")[2][:-1])[0])
+                return {k: v for k, v in many(call).items() if k != "999"}
+            return many(call)
+
+        page.compat = compat
+        state = self.reconcile(page)
+        self.assertNotIn("1245040", queried)
+        self.assertNotIn("1826330", queried)
+        self.assertEqual(page.sets, [("11", TOOL)])
+        self.assertEqual(state["auto"], {"10": TOOL, "11": TOOL})
+        self.assertEqual(self.helper.installed, ["10", "11", "999"])
+
+    def test_user_selected_valve_proton_is_preserved_live(self):
+        page = FakePage({"0": TOOL, "10": TOOL, "11": "proton_9", "12": "proton_experimental"},
+                        [TOOL, TOOL_11, "proton_9", "proton_experimental"])
+        state = self.reconcile(page)
+        self.assertEqual(page.sets, [])
+        self.assertEqual(page.mapping["11"], "proton_9")
+        self.assertEqual(page.mapping["12"], "proton_experimental")
+        self.assertNotIn("11", state["auto"])
+        self.assertNotIn("12", state["auto"])
+        self.assertIn("proton_9", state["known_tools"])
+
+
 
 SWITCH_HARNESS = r"""
 const sent = [], asked = [];
